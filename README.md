@@ -302,3 +302,4 @@ python -m PyInstaller gift_radar_bot.spec --noconfirm --clean
 # tgp
 # tgp
 # tgp
+# tgp
