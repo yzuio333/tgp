@@ -299,3 +299,4 @@ python -m PyInstaller gift_radar_bot.spec --noconfirm --clean
 * Программа только читает витрину и ничего не покупает.
 # tgp
 # tgp
+# tgp
