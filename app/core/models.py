@@ -157,24 +157,5 @@ def parse(gift, collection_title: str = "", users: dict | None = None) -> Listin
 
 
 def passes(cfg: dict, item: Listing) -> bool:
-    """Проходит ли лот пользовательские фильтры (валюта + цена)."""
-    if item.currency == "stars" and not cfg.get("cur_stars", True):
-        return False
-    if item.currency == "ton" and not cfg.get("cur_ton", True):
-        return False
-
-    if cfg.get("show_rich", False) and not item.is_rich:
-        return False
-
-    if cfg.get("require_username", False) and not item.owner_username:
-        return False
-
-    # пороги цены заданы в звёздах, поэтому к TON-лотам не применяются
-    if item.currency == "stars":
-        lo = float(cfg.get("min_price", 0) or 0)
-        hi = float(cfg.get("max_price", 0) or 0)
-        if lo and item.price < lo:
-            return False
-        if hi and item.price > hi:
-            return False
+    """Лот не отбрасывается: цена используется только для маршрутизации."""
     return True

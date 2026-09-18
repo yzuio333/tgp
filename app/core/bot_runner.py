@@ -340,6 +340,7 @@ class GiftBot:
                     peer=int(group_id),
                     offset_date=None,
                     offset_id=0,
+                    offset_topic=0,
                     limit=100,
                     q="",
                 )),
@@ -1361,6 +1362,21 @@ class GiftBot:
                     disabled=disabled_cats,
                     topics=topics_map,
                 )
+                if not cat_key:
+                    # Не теряем лоты, которые не попали в диапазон цены
+                    # или не имеют специальных признаков. Для них используем
+                    # общий ценовой топик, а если он отключён — первый
+                    # доступный топик группы.
+                    fallback = "price_300_1000"
+                    if (fallback not in disabled_cats
+                            and topics_map.get(fallback)):
+                        cat_key = fallback
+                    else:
+                        cat_key = next(
+                            (key for key in categories.CATEGORY_PRIORITY
+                             if key not in disabled_cats and topics_map.get(key)),
+                            None,
+                        )
                 topic_id = topics_map.get(cat_key) if cat_key else None
                 if topic_id:
                     try:
@@ -1374,7 +1390,7 @@ class GiftBot:
                                 parse_mode="html",
                                 link_preview=True,
                             ),
-                            timeout=15,
+                            timeout=3,
                         )
                         self._group_lots[(int(group_id), int(sent.id))] = (item, owner_info, seller)
                         self.stats["sent"] += 1
@@ -1420,4 +1436,4 @@ class GiftBot:
 
     def log(self, text: str) -> None:
         ts = time.strftime("%H:%M:%S")
-        print(f"[{ts}] {text}")
+        print(f"[{ts}] {text}", flush=True)
