@@ -65,7 +65,17 @@ def main() -> int:
         ask("Enter — закрыть...")
         return 1
     finally:
-        loop.close()
+        # Telethon создаёт внутренние сетевые задачи. Перед закрытием loop
+        # явно отменяем и дожидаемся их, иначе Python 3.14 пишет
+        # "Task was destroyed but it is pending".
+        if not loop.is_closed():
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
     return 0
 
 

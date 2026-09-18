@@ -22,7 +22,8 @@ class OwnerInfo:
     def __init__(self, known: bool = False, plain: int = 0, nft: int = 0,
                  can_write: bool = False, reason: str = "",
                  is_ru: bool = False, ru_hint: str = "",
-                 country: str = "", lang: str = "", about: str = ""):
+                 country: str = "", lang: str = "", about: str = "",
+                 counts_known: bool = False):
         self.known = known          # удалось ли вообще опросить владельца
         self.plain = plain          # обычных подарков в профиле
         self.nft = nft              # уникальных (NFT) в профиле
@@ -33,6 +34,7 @@ class OwnerInfo:
         self.country = country
         self.lang = lang
         self.about = about
+        self.counts_known = counts_known
 
     def __repr__(self) -> str:
         return (f"OwnerInfo(known={self.known}, plain={self.plain}, nft={self.nft}, "
@@ -95,24 +97,32 @@ class OwnerCache:
         except RPCError:
             self.me_premium = False
 
-    async def info(self, client, user) -> OwnerInfo:
-        """user — объект User из ответа маркета (или None, если владелец скрыт)."""
+    async def info(self, client, user, with_counts: bool = True) -> OwnerInfo:
+        """Получить профиль владельца.
+
+        Для маршрутизации по языку/стране/имени достаточно профиля без
+        подсчёта подарков. Фильтры владельца вызывают этот метод с
+        ``with_counts=True`` и получают полный результат.
+        """
         if user is None:
             return OwnerInfo(known=False, reason="владелец скрыт")
 
         cached = self._data.get(user.id)
-        if cached and time.time() - cached[0] < self.ttl:
+        if (cached and time.time() - cached[0] < self.ttl
+                and (not with_counts or cached[1].counts_known)):
             return cached[1]
 
-        info = await self._fetch(client, user)
+        info = await self._fetch(client, user, with_counts=with_counts)
         self._data[user.id] = (time.time(), info)
         return info
 
-    async def _fetch(self, client, user) -> OwnerInfo:
+    async def _fetch(self, client, user, with_counts: bool = True) -> OwnerInfo:
         if getattr(user, "deleted", False):
-            return OwnerInfo(known=True, can_write=False, reason="аккаунт удалён")
+            return OwnerInfo(known=True, can_write=False, reason="аккаунт удалён",
+                             counts_known=True)
         if getattr(user, "bot", False):
-            return OwnerInfo(known=True, can_write=False, reason="это бот")
+            return OwnerInfo(known=True, can_write=False, reason="это бот",
+                             counts_known=True)
 
         peer = types.InputPeerUser(user.id, user.access_hash or 0)
 
@@ -125,10 +135,9 @@ class OwnerCache:
 
         uf = full.full_user
         total = getattr(uf, "stargifts_count", 0) or 0
-
-        # сколько из них обычных: то же обращение, но без уникальных
         plain = 0
-        if total:
+        if with_counts and total:
+            # Сколько из них обычных: то же обращение, но без уникальных.
             try:
                 saved = await client(functions.payments.GetSavedStarGiftsRequest(
                     peer=peer, offset="", limit=1, exclude_unique=True,
@@ -148,7 +157,8 @@ class OwnerCache:
         return OwnerInfo(known=True, plain=plain, nft=nft,
                          can_write=can_write, reason=reason,
                          is_ru=is_ru, ru_hint=ru_hint,
-                         country=country, lang=lang, about=about)
+                         country=country, lang=lang, about=about,
+                         counts_known=with_counts)
 
     def _russian(self, uf, user) -> tuple[bool, str]:
         """Похоже ли, что продавец русскоязычный.

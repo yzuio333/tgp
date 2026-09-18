@@ -396,14 +396,11 @@ def guest_welcome():
         "Купить/продать NFT за рубли — у @tonswiza."
     )
     buttons = [
-        [Button.inline("👤 Подписка", b"guest:sub")],
-        [Button.inline("Партнёрка", b"guest:partner")],
-        [Button.inline("Расширенные функции", b"guest:features")],
-        [Button.inline("ℹ Информация", b"guest:info")],
-        [
-            Button.url("Поддержка ↗", "https://t.me/sahil_ui"),
-            Button.inline("Парсер ↗", b"guest:parser"),
-        ],
+        [ibtn("Подписка", b"guest:sub", "👤", style="primary")],
+        [ibtn("Партнёрка", b"guest:partner", "💯", style="primary")],
+        [ibtn("Расширенные функции", b"guest:features", "⚙️", style="primary")],
+        [ibtn("Информация", b"guest:info", "🧐", style="primary")],
+        [Button.url("Поддержка ↗", "https://t.me/sahil_ui", style="primary", icon=_CUSTOM_EMOJI["🔜"])],
     ]
     return text, buttons
 

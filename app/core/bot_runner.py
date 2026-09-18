@@ -22,13 +22,14 @@ from telethon.errors import (
     RPCError,
     SessionPasswordNeededError,
 )
+from telethon.tl import functions
 
 from .. import config
 from . import bot_ui, categories, memory, scanner
 from . import owner as owner_mod
 from .models import Listing, parse, passes
 
-MAX_PER_CYCLE = 200
+MAX_PER_CYCLE = 10000
 SEND_PAUSE = 0.15
 
 HELP = f"""{bot_ui.E_SAT} <b>Gift Radar</b> — слежу за резейл-маркетом подарков.
@@ -74,7 +75,7 @@ SET_FIELDS = {
 }
 
 
-def render(item) -> str:
+def render(item, owner_info=None) -> str:
     """HTML-текст сообщения о лоте."""
     esc = html.escape
     head = f'<a href="{item.url}">⁠</a>' if item.url else ""
@@ -101,6 +102,11 @@ def render(item) -> str:
         seller = f"{bot_ui.E_USER} <i>продавец скрыт</i>"
     lines.append(seller)
 
+    if owner_info is not None and getattr(owner_info, "known", False):
+        total = int(getattr(owner_info, "plain", 0) or 0) + int(getattr(owner_info, "nft", 0) or 0)
+        nft = int(getattr(owner_info, "nft", 0) or 0)
+        lines.append(f"{bot_ui.E_GIFT} Профиль: ⭐ подарков <b>{total}</b> · NFT <b>{nft}</b>")
+
     tail = []
     if item.supply_text:
         tail.append(f"тираж {item.supply_text}")
@@ -120,6 +126,11 @@ def buttons(item) -> list:
         row.append(Button.url("Написать", item.owner_link))
     row.append(Button.inline("✓ Готово", b"done"))
     return [row]
+
+
+def work_button() -> list:
+    """Кнопка первичного забора лота из групповой ленты."""
+    return [[Button.inline("! WORK", b"work", style="success")]]
 
 
 class GiftBot:
@@ -144,6 +155,12 @@ class GiftBot:
         self._hud_msg: dict[int, object] = {}
         self._hud_screen: dict[int, str] = {}
         self._hud_at = 0.0
+        self._background_tasks: set[asyncio.Task] = set()
+        self._shutdown_started = False
+        self._restart_task: asyncio.Task | None = None
+        self._restart_requested = False
+        self._group_warning = ""
+        self._group_lots: dict[tuple[int, int], tuple[Listing, object, object]] = {}
         self.stats = {
             "started": time.time(), "scanning": True, "cycles": 0,
             "found": 0, "sent": 0, "skip_owner": 0, "skip_filter": 0,
@@ -247,13 +264,16 @@ class GiftBot:
         await self.owners.load_me(self.user)
         self.catalog = await scanner.catalog(self.user)
         self._apply_targets()
+        await self._auto_configure_group()
 
         for chat_id in self.subs:
             if self.has_access(chat_id):
                 await self._safe_send(chat_id, f"{bot_ui.E_ROCKET} Бот перезапущен. /menu — панель управления.")
 
-        asyncio.create_task(self._scan_loop())
-        asyncio.create_task(self._hud_loop())
+        self._background_tasks = {
+            asyncio.create_task(self._scan_loop(), name="giftbot-scan"),
+            asyncio.create_task(self._hud_loop(), name="giftbot-hud"),
+        }
         self.log("Готово. Напишите боту /start, затем /menu. Ctrl+C — выход.")
         try:
             await self.bot.run_until_disconnected()
@@ -262,9 +282,34 @@ class GiftBot:
         finally:
             self.log("Остановка, отправка уведомлений...")
             await self.shutdown_message()
+            if self._restart_requested:
+                # Перезапуск выполняется из основного жизненного цикла, а не
+                # из фоновой callback-задачи. Иначе loop закрывается раньше,
+                # чем фоновая задача успевает вызвать os.execv().
+                await asyncio.sleep(0.5)
+                python = sys.executable
+                os.execv(python, [python] + sys.argv)
 
     async def shutdown_message(self) -> None:
         """Отправляет подписчикам уведомление о выключении бота."""
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        self.alive = False
+        self.scanning = False
+        self.stats["scanning"] = False
+
+        # Не оставляем _scan_loop и _hud_loop жить до закрытия event loop.
+        # Иначе asyncio при перезапуске пишет "Task was destroyed...".
+        current = asyncio.current_task()
+        pending = [task for task in self._background_tasks
+                   if task is not current and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._background_tasks.clear()
+
         if self.bot and self.bot.is_connected():
             for chat_id in self.subs:
                 try:
@@ -283,12 +328,93 @@ class GiftBot:
         if self.user and self.user.is_connected() and self.user not in self.scanner_clients:
             await self.user.disconnect()
 
+    async def _auto_bind_group_topics(self, group_id: int) -> tuple[dict, str | None]:
+        """Находит уже созданные форумные топики и привязывает их по названиям."""
+        # Bot API/MTProto ограничивает GetForumTopicsRequest для bot-клиентов.
+        # Читаем список тем пользовательским аккаунтом, а сообщения всё равно
+        # отправляем отдельно через self.bot.
+        reader = self.user or self.bot
+        try:
+            result = await asyncio.wait_for(
+                reader(functions.messages.GetForumTopicsRequest(
+                    peer=int(group_id),
+                    offset_date=None,
+                    offset_id=0,
+                    limit=100,
+                    q="",
+                )),
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Не удалось прочитать топики группы {group_id}: {exc}")
+            return {}, exc.__class__.__name__
+
+        group = self.cfg.setdefault("group_settings", {})
+        topics = group.setdefault("topics", {})
+        bound = {}
+        for topic in getattr(result, "topics", []) or []:
+            key = categories.topic_key(getattr(topic, "title", ""))
+            if key and not topics.get(key):
+                topics[key] = int(topic.id)
+                bound[key] = int(topic.id)
+
+        self._save()
+        return bound, None
+
+    async def _find_forum_groups(self) -> list[tuple[int, str]]:
+        """Возвращает доступные аккаунту чтения форумные супергруппы."""
+        found = []
+        reader = self.user or self.bot
+        try:
+            async for dialog in reader.iter_dialogs():
+                entity = dialog.entity
+                if not getattr(entity, "megagroup", False):
+                    continue
+                if not getattr(entity, "forum", False):
+                    continue
+                found.append((int(dialog.id), getattr(entity, "title", str(dialog.id))))
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Не удалось найти форумные группы: {exc}")
+        return found
+
+    async def _auto_configure_group(self) -> tuple[int | None, list[tuple[int, str]]]:
+        """Автоматически подключает единственную форумную группу, если она есть."""
+        group = self.cfg.setdefault("group_settings", {})
+        current_id = group.get("group_id")
+        if current_id:
+            return int(current_id), []
+
+        candidates = await self._find_forum_groups()
+        if len(candidates) != 1:
+            return None, candidates
+
+        group_id, title = candidates[0]
+        group["group_id"] = group_id
+        bound, error = await self._auto_bind_group_topics(group_id)
+        self._save()
+        if error:
+            self.log(f"Группа найдена: {title} ({group_id}), но топики не прочитаны")
+        else:
+            self.log(f"Группа найдена: {title} ({group_id}), привязано топиков: {len(bound)}")
+        return group_id, candidates
+
     def _apply_targets(self) -> None:
         chosen = set(self.cfg.get("collections") or [])
+        excluded = [str(value).casefold().strip()
+                    for value in self.cfg.get("excluded_collections", []) if str(value).strip()]
+
+        def allowed(collection: dict) -> bool:
+            title = str(collection.get("title", "")).casefold()
+            return not any(value in title for value in excluded)
+
         if self.cfg.get("collections_set"):
-            self.targets = [(c["id"], c["title"]) for c in self.catalog if c["id"] in chosen]
+            self.targets = [(c["id"], c["title"]) for c in self.catalog
+                            if c["id"] in chosen and allowed(c)]
         else:
-            self.targets = [(c["id"], c["title"]) for c in self.catalog if c["resale"]]
+            self.targets = [(c["id"], c["title"]) for c in self.catalog
+                            if c["resale"] and allowed(c)]
+        if excluded:
+            self.log("Исключены коллекции: " + ", ".join(excluded))
         self.log(f"Отслеживаю коллекций: {len(self.targets)}")
 
     def _save(self) -> None:
@@ -428,12 +554,37 @@ class GiftBot:
 
             if "group_settings" not in self.cfg:
                 self.cfg["group_settings"] = {"enabled": True, "group_id": None, "topics": {}}
+            previous_group_id = self.cfg["group_settings"].get("group_id")
             self.cfg["group_settings"]["group_id"] = event.chat_id
+            if previous_group_id != event.chat_id:
+                self.cfg["group_settings"]["topics"] = {}
             self._save()
+
+            bound, bind_error = await self._auto_bind_group_topics(event.chat_id)
             keys_list = "\n".join(f"• <code>{k}</code> — {v}" for k, v in categories.CATEGORIES.items())
+            if bound:
+                bound_text = "\n".join(
+                    f"• {categories.CATEGORIES[key]} → топик #{topic_id}"
+                    for key, topic_id in bound.items()
+                )
+                bind_status = f"\n\n<b>Автоматически привязано:</b>\n{bound_text}"
+            elif bind_error:
+                bind_status = (
+                    "\n\n⚠️ Не удалось прочитать список топиков. "
+                    "Привяжите их вручную командой <code>/bind ключ</code> "
+                    "внутри нужной темы."
+                )
+            else:
+                bind_status = (
+                    "\n\n⚠️ Совпадений по названиям не найдено. "
+                    "Привяжите темы вручную командой <code>/bind ключ</code>."
+                )
             await event.respond(
                 f"✅ <b>Супергруппа привязана (ID: <code>{event.chat_id}</code>)!</b>\n\n"
-                "Теперь в каждой теме (топике) форума отправьте команду <code>/bind &lt;ключ&gt;</code> для привязки категории.\n\n"
+                "Бот попытался сопоставить уже созданные темы по названиям."
+                f"{bind_status}\n\n"
+                "Если какая-то тема не совпала, отправьте в ней команду "
+                "<code>/bind &lt;ключ&gt;</code>.\n\n"
                 f"<b>Доступные ключи:</b>\n{keys_list}",
                 parse_mode="html"
             )
@@ -441,6 +592,9 @@ class GiftBot:
         @bot.on(events.NewMessage(pattern=r"^/bind(?:\s+(\S+))?(?:\s+(\d+))?"))
         async def _(event):
             if not self.is_ceo(event.sender_id or event.chat_id):
+                return
+            if event.is_private:
+                await event.respond("⚠️ Команду /bind нужно отправлять внутри нужной темы форумной группы.")
                 return
             key = (event.pattern_match.group(1) or "").lower()
             explicit_topic = event.pattern_match.group(2)
@@ -464,6 +618,10 @@ class GiftBot:
 
             if "group_settings" not in self.cfg:
                 self.cfg["group_settings"] = {"enabled": True, "group_id": None, "topics": {}}
+            previous_group_id = self.cfg["group_settings"].get("group_id")
+            self.cfg["group_settings"]["group_id"] = event.chat_id
+            if previous_group_id != event.chat_id:
+                self.cfg["group_settings"]["topics"] = {}
             if "topics" not in self.cfg["group_settings"]:
                 self.cfg["group_settings"]["topics"] = {}
 
@@ -665,6 +823,9 @@ class GiftBot:
         if data == "done":
             await event.delete()
             return
+        if data == "work":
+            await self._claim_group_lot(event)
+            return
         if data == "noop":
             await event.answer()
             return
@@ -792,6 +953,49 @@ class GiftBot:
         await self._edit(event, text, btns)
         await event.answer(note or "")
 
+    async def _claim_group_lot(self, event) -> None:
+        """Выдаёт лот первому нажавшему кнопку WORK."""
+        key = (int(event.chat_id), int(event.message_id))
+        record = self._group_lots.pop(key, None)
+        if record is None:
+            await event.answer("Лот уже забрали или он устарел.", alert=True)
+            return
+
+        item, owner_info, seller = record
+        try:
+            await event.delete()
+        except RPCError as exc:
+            self.log(f"Не удалось удалить забранный лот {item.key}: {exc.__class__.__name__}")
+
+        if (seller is not None and self.user is not None
+                and not getattr(owner_info, "counts_known", False)):
+            try:
+                owner_info = await self.owners.info(
+                    self.user, seller, with_counts=True
+                )
+            except FloodWaitError as exc:
+                self.log(f"FloodWait на профиле победителя: {exc.seconds} сек")
+                await asyncio.sleep(exc.seconds + 1)
+            except RPCError as exc:
+                self.log(f"Не удалось получить профиль победителя: {exc.__class__.__name__}")
+
+        text = render(item, owner_info)
+        try:
+            await self.bot.send_message(
+                event.sender_id,
+                text,
+                buttons=buttons(item),
+                parse_mode="html",
+                link_preview=True,
+            )
+            await event.answer("Лот отправлен вам в личные сообщения.")
+        except RPCError as exc:
+            self.log(f"Не удалось отправить лот {item.key} победителю {event.sender_id}: {exc}")
+            await event.answer(
+                "Лот забран, но Telegram не разрешил написать вам в личные сообщения.",
+                alert=True,
+            )
+
     async def _on_admin_button(self, event, data: str) -> None:
         chat_id = event.chat_id
         if data == "admin:menu":
@@ -803,7 +1007,30 @@ class GiftBot:
 
         elif data == "admin:toggle_group":
             grp = self.cfg.setdefault("group_settings", {})
-            grp["enabled"] = not grp.get("enabled", True)
+            turning_on = not grp.get("enabled", True)
+            if turning_on and not grp.get("group_id"):
+                group_id, candidates = await self._auto_configure_group()
+                if not group_id:
+                    if len(candidates) > 1:
+                        names = ", ".join(title for _gid, title in candidates[:5])
+                        await event.answer(
+                            f"Найдено несколько форумных групп: {names}. Отправьте /setup_group в нужной.",
+                            alert=True,
+                        )
+                    else:
+                        await event.answer(
+                            "Сначала добавьте бота в форумную супергруппу и отправьте там /setup_group.",
+                            alert=True,
+                        )
+                    return
+                grp = self.cfg.setdefault("group_settings", {})
+            if turning_on and not any(grp.get("topics", {}).values()):
+                bound, error = await self._auto_bind_group_topics(grp["group_id"])
+                if not any(grp.get("topics", {}).values()):
+                    detail = "не удалось прочитать топики" if error else "не найдено ни одного привязанного топика"
+                    await event.answer(f"Нельзя включить рассылку: {detail}.", alert=True)
+                    return
+            grp["enabled"] = turning_on
             self._save()
             text, btns = bot_ui.admin_menu(self.cfg)
             await self._edit(event, text, btns)
@@ -873,10 +1100,29 @@ class GiftBot:
 
     async def _restart_bot(self, chat_id: int) -> None:
         await self.bot.send_message(chat_id, "🔄 Перезапускаю бота...")
-        await self.shutdown_message()
-        await asyncio.sleep(1)
-        python = sys.executable
-        os.execv(python, [python] + sys.argv)
+        # Нельзя отключать bot прямо из CallbackQuery-обработчика:
+        # Telethon отменяет текущий handler во время disconnect(), и код
+        # после await self.bot.disconnect() не выполняется. В итоге процесс
+        # закрывает event loop с живыми сетевыми задачами.
+        if self._restart_task and not self._restart_task.done():
+            return
+        self._restart_task = asyncio.create_task(
+            self._restart_process(), name="giftbot-restart"
+        )
+
+    async def _restart_process(self) -> None:
+        """Запрашивает перезапуск, оставляя завершение основному циклу."""
+        try:
+            await asyncio.sleep(0.5)
+            self._restart_requested = True
+            # Это только выводит run_until_disconnected() в его штатный
+            # finally, где клиенты закрываются и затем запускается процесс.
+            if self.bot and self.bot.is_connected():
+                await self.bot.disconnect()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Ошибка перезапуска: {exc}")
 
     def _nudge(self, field: str, delta: int) -> None:
         if field == "interval":
@@ -1039,6 +1285,9 @@ class GiftBot:
                     self.stats["found"] += 1
                     self.stats["last_found"] = item.ts
                     batch.append((item, users))
+                    # Отправляем сразу после обнаружения, не ждём завершения
+                    # обхода всех коллекций.
+                    await self._broadcast([(item, users)])
 
                 await asyncio.sleep(delay)
 
@@ -1051,7 +1300,6 @@ class GiftBot:
                 f"{self.stats['skip_owner'] + self.stats['skip_filter']}, "
                 f"подписчиков {len(self.subs)}"
             )
-            await self._broadcast(batch)
             await self._refresh_hud(force=True)
             await asyncio.sleep(float(self.cfg.get("poll_interval", 20)))
 
@@ -1080,54 +1328,78 @@ class GiftBot:
         topics_map = grp_cfg.get("topics", {})
         disabled_cats = set(self.cfg.get("disabled_categories", []))
 
-        extra = len(batch) - MAX_PER_CYCLE
+        sent_before = self.stats["sent"]
         for entry in batch[:MAX_PER_CYCLE]:
             if not self.scanning:
                 break
 
             item, users = entry
-            rendered = render(item)
-            item_btns = buttons(item)
+            owner_info = None
 
             # 1. Отправка в супергруппу по топикам форума
             if grp_enabled and group_id:
+                if not any(topics_map.values()):
+                    _bound, _error = await self._auto_bind_group_topics(group_id)
+                    topics_map = self.cfg.get("group_settings", {}).get("topics", {})
+
+                if not any(topics_map.values()):
+                    warning = f"no-topics:{group_id}"
+                    if self._group_warning != warning:
+                        self._group_warning = warning
+                        self.log(
+                            f"Группа {group_id} подключена, но топики не привязаны. "
+                            "Выполните /setup_group или /bind <ключ> в темах."
+                        )
+                else:
+                    self._group_warning = ""
+
                 seller = users.get(item.owner_id) if users else None
                 owner_info = self.owners._data.get(item.owner_id, (0, None))[1] if hasattr(self.owners, "_data") else None
                 matched_cats = categories.classify(item, owner_info=owner_info, user_obj=seller)
-                sent_topics = set()
-                for cat_key in matched_cats:
-                    if cat_key in disabled_cats:
-                        continue
-                    topic_id = topics_map.get(cat_key)
-                    if topic_id and topic_id not in sent_topics:
-                        try:
-                            await self.bot.send_message(
+                cat_key = categories.primary_category(
+                    matched_cats,
+                    disabled=disabled_cats,
+                    topics=topics_map,
+                )
+                topic_id = topics_map.get(cat_key) if cat_key else None
+                if topic_id:
+                    try:
+                        rendered = render(item, owner_info)
+                        sent = await asyncio.wait_for(
+                            self.bot.send_message(
                                 int(group_id),
                                 rendered,
                                 reply_to=int(topic_id),
-                                buttons=item_btns,
+                                buttons=work_button(),
                                 parse_mode="html",
-                                link_preview=True
-                            )
-                            sent_topics.add(topic_id)
-                        except Exception as e:
-                            self.log(f"Ошибка отправки в группу {group_id} топик {topic_id}: {e}")
-
-            # 2. Отправка подписчикам в ЛС (только с активной подпиской)
-            active_subs = [cid for cid in self.subs if self.has_access(cid)]
-            for chat_id in active_subs:
-                await self._safe_send(chat_id, rendered, item_btns, preview=True)
+                                link_preview=True,
+                            ),
+                            timeout=15,
+                        )
+                        self._group_lots[(int(group_id), int(sent.id))] = (item, owner_info, seller)
+                        self.stats["sent"] += 1
+                        if self.stats["sent"] % 25 == 0:
+                            self.log(f"Прогресс рассылки: {self.stats['sent']} отправлено")
+                    except asyncio.TimeoutError:
+                        self.log(
+                            f"Тайм-аут отправки {item.title} #{item.num} "
+                            f"в группу {group_id}, продолжаю сканирование"
+                        )
+                    except Exception as e:
+                        self.log(f"Ошибка отправки в группу {group_id} топик {topic_id}: {e}")
+                elif self._group_warning != f"no-route:{group_id}":
+                    self._group_warning = f"no-route:{group_id}"
+                    self.log(
+                        f"Не найден топик для лота {item.title} #{item.num}; "
+                        "проверьте привязку ценовой категории"
+                    )
 
             await asyncio.sleep(SEND_PAUSE)
 
-        if extra > 0 and self.scanning:
-            active_subs = [cid for cid in self.subs if self.has_access(cid)]
-            for chat_id in active_subs:
-                await self._safe_send(chat_id, f"…и ещё {extra} лотов за этот круг.")
-
-        shown = min(len(batch), MAX_PER_CYCLE)
-        self.stats["sent"] += shown
-        self.log(f"Отправлено лотов: {shown}")
+        sent_now = self.stats["sent"] - sent_before
+        if len(batch) > MAX_PER_CYCLE:
+            self.log(f"Пачка ограничена {MAX_PER_CYCLE} лотами; остальные останутся для следующего прохода")
+        self.log(f"Отправлено лотов: {sent_now}")
 
     async def _safe_send(self, chat_id: int, text: str, btns=None,
                          preview: bool = False) -> None:

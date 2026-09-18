@@ -11,9 +11,9 @@ CEO_ID = 7863407516
 DEFAULTS = {
     "api_id": 0,
     "api_hash": "",
-    "poll_interval": 20,        # пауза между полными кругами обхода, сек
-    "request_delay": 0.6,       # пауза между запросами к API, сек
-    "page_limit": 50,           # сколько лотов тянуть с первой страницы коллекции
+    "poll_interval": 10,        # пауза между полными кругами обхода, сек
+    "request_delay": 0.2,       # пауза между запросами к API, сек
+    "page_limit": 100,          # сколько лотов тянуть с первой страницы коллекции
     "only_active_resale": True, # обходить только коллекции, где сейчас есть резейл
     "show_existing_on_start": False,  # показать лоты, найденные при первом проходе
     "cur_stars": True,          # показывать лоты за звёзды
@@ -42,6 +42,7 @@ DEFAULTS = {
     },
     "disabled_categories": [],  # выключенные категории/темы лотов
     "accounts": [],             # список дополнительных аккаунтов для парсинга
+    "excluded_collections": [], # коллекции, которые не нужно проверять
 }
 
 
@@ -81,6 +82,8 @@ def load() -> dict:
         cfg["disabled_categories"] = []
     if "accounts" not in cfg:
         cfg["accounts"] = []
+    if "excluded_collections" not in cfg:
+        cfg["excluded_collections"] = []
     return cfg
 
 
