@@ -31,6 +31,8 @@ from .models import Listing, parse, passes
 
 MAX_PER_CYCLE = 10000
 SEND_PAUSE = 0.15
+GROUP_SEND_ATTEMPTS = 3
+GROUP_SEND_RETRY_DELAY = 1.0
 
 HELP = f"""{bot_ui.E_SAT} <b>Gift Radar</b> — слежу за резейл-маркетом подарков.
 
@@ -1273,13 +1275,15 @@ class GiftBot:
                     item = parse(g, title, users)
                     if item is None or item.key in self.seen:
                         continue
-                    self.seen.add(item.key)
                     if not self.primed and not show_existing:
+                        self.seen.add(item.key)
                         continue
                     if not passes(self.cfg, item):
+                        self.seen.add(item.key)
                         self.stats["skip_filter"] += 1
                         continue
                     if check_owner and not await self._owner_ok(item, users):
+                        self.seen.add(item.key)
                         self.stats["skip_owner"] += 1
                         continue
                     item.ts = time.time()
@@ -1287,8 +1291,11 @@ class GiftBot:
                     self.stats["last_found"] = item.ts
                     batch.append((item, users))
                     # Отправляем сразу после обнаружения, не ждём завершения
-                    # обхода всех коллекций.
-                    await self._broadcast([(item, users)])
+                    # обхода всех коллекций. Лот помечается просмотренным
+                    # только после успешной доставки: временная ошибка Telegram
+                    # не должна навсегда терять найденный подарок.
+                    if await self._broadcast([(item, users)]):
+                        self.seen.add(item.key)
 
                 await asyncio.sleep(delay)
 
@@ -1319,9 +1326,9 @@ class GiftBot:
             self.log(f"{item.title} #{item.num}: пропуск — {why}")
         return ok
 
-    async def _broadcast(self, batch: list) -> None:
+    async def _broadcast(self, batch: list) -> int:
         if not batch:
-            return
+            return 0
 
         grp_cfg = self.cfg.get("group_settings", {})
         grp_enabled = grp_cfg.get("enabled", True)
@@ -1356,6 +1363,26 @@ class GiftBot:
 
                 seller = users.get(item.owner_id) if users else None
                 owner_info = self.owners._data.get(item.owner_id, (0, None))[1] if hasattr(self.owners, "_data") else None
+                # Географические категории требуют данных полного профиля.
+                # Раньше профиль загружался только при включённых фильтрах
+                # владельца, поэтому обычный режим не мог определить страну.
+                if owner_info is None and seller is not None:
+                    client = self.scanner_clients[self._client_idx] if self.scanner_clients else self.user
+                    try:
+                        owner_info = await self.owners.info(
+                            client, seller, with_counts=False
+                        )
+                    except FloodWaitError as exc:
+                        self.log(
+                            f"FloodWait {exc.seconds} сек при определении "
+                            f"категории {item.title} #{item.num}; "
+                            "использую данные из выдачи"
+                        )
+                    except RPCError as exc:
+                        self.log(
+                            f"Профиль для категории {item.title} #{item.num}: "
+                            f"{exc.__class__.__name__}"
+                        )
                 matched_cats = categories.classify(item, owner_info=owner_info, user_obj=seller)
                 cat_key = categories.primary_category(
                     matched_cats,
@@ -1379,30 +1406,47 @@ class GiftBot:
                         )
                 topic_id = topics_map.get(cat_key) if cat_key else None
                 if topic_id:
-                    try:
-                        rendered = render(item, owner_info)
-                        sent = await asyncio.wait_for(
-                            self.bot.send_message(
+                    rendered = render(item, owner_info)
+                    for attempt in range(1, GROUP_SEND_ATTEMPTS + 1):
+                        try:
+                            # Не обрываем запрос искусственным трёхсекундным
+                            # тайм-аутом: Telegram нередко отвечает дольше, а
+                            # отменённый запрос мог уже создать сообщение.
+                            sent = await self.bot.send_message(
                                 int(group_id),
                                 rendered,
                                 reply_to=int(topic_id),
                                 buttons=work_button(),
                                 parse_mode="html",
                                 link_preview=True,
-                            ),
-                            timeout=3,
-                        )
-                        self._group_lots[(int(group_id), int(sent.id))] = (item, owner_info, seller)
-                        self.stats["sent"] += 1
-                        if self.stats["sent"] % 25 == 0:
-                            self.log(f"Прогресс рассылки: {self.stats['sent']} отправлено")
-                    except asyncio.TimeoutError:
-                        self.log(
-                            f"Тайм-аут отправки {item.title} #{item.num} "
-                            f"в группу {group_id}, продолжаю сканирование"
-                        )
-                    except Exception as e:
-                        self.log(f"Ошибка отправки в группу {group_id} топик {topic_id}: {e}")
+                            )
+                            self._group_lots[(int(group_id), int(sent.id))] = (item, owner_info, seller)
+                            self.stats["sent"] += 1
+                            if self.stats["sent"] % 25 == 0:
+                                self.log(f"Прогресс рассылки: {self.stats['sent']} отправлено")
+                            break
+                        except FloodWaitError as exc:
+                            self.log(
+                                f"FloodWait {exc.seconds} сек при отправке "
+                                f"{item.title} #{item.num} в топик {topic_id}"
+                            )
+                            await asyncio.sleep(exc.seconds + 1)
+                        except (RPCError, OSError) as exc:
+                            self.log(
+                                f"Ошибка отправки {item.title} #{item.num} "
+                                f"в группу {group_id}, топик {topic_id}, "
+                                f"попытка {attempt}/{GROUP_SEND_ATTEMPTS}: "
+                                f"{exc.__class__.__name__}: {exc}"
+                            )
+                            if attempt < GROUP_SEND_ATTEMPTS:
+                                await asyncio.sleep(GROUP_SEND_RETRY_DELAY * attempt)
+                        except Exception as exc:  # noqa: BLE001
+                            self.log(
+                                f"Неожиданная ошибка отправки {item.title} "
+                                f"#{item.num} в группу {group_id}, топик "
+                                f"{topic_id}: {exc.__class__.__name__}: {exc}"
+                            )
+                            break
                 elif self._group_warning != f"no-route:{group_id}":
                     self._group_warning = f"no-route:{group_id}"
                     self.log(
@@ -1416,6 +1460,7 @@ class GiftBot:
         if len(batch) > MAX_PER_CYCLE:
             self.log(f"Пачка ограничена {MAX_PER_CYCLE} лотами; остальные останутся для следующего прохода")
         self.log(f"Отправлено лотов: {sent_now}")
+        return sent_now
 
     async def _safe_send(self, chat_id: int, text: str, btns=None,
                          preview: bool = False) -> None:
